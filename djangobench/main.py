@@ -9,14 +9,19 @@ import argparse
 import email
 import simplejson
 import sys
+import os
 from djangobench import perf
 from unipath import DIRS, FSPath as Path
 
 __version__ = '0.9'
 
+# Define environment system commands that will invoke the right interpreter
+cpython = 'python2.6'
+pypy = 'pypy'
+
 DEFAULT_BENCMARK_DIR = Path(__file__).parent.child('benchmarks').absolute()
 
-def run_benchmarks(control, experiment, benchmark_dir, benchmarks, trials, vcs=None, record_dir=None, profile_dir=None):
+def run_benchmarks(control, benchmark_dir, benchmarks, trials, record_dir=None, profile_dir=None):
     if benchmarks:
         print "Running benchmarks: %s" % " ".join(benchmarks)
     else:
@@ -28,38 +33,27 @@ def run_benchmarks(control, experiment, benchmark_dir, benchmarks, trials, vcs=N
             raise ValueError('Recording directory "%s" does not exist' % record_dir)
         print "Recording data to '%s'" % record_dir
 
-    control_label = get_django_version(control, vcs=vcs)
-    experiment_label = get_django_version(experiment, vcs=vcs)
-    branch_info = "%s branch " % vcs if vcs else ""
-    print "Control: Django %s (in %s%s)" % (control_label, branch_info, control)
-    print "Experiment: Django %s (in %s%s)" % (experiment_label, branch_info, experiment)
+    control_label = get_django_version(control, vcs=None)
+    branch_info =  ""
+    print "Benchmarking: Django %s (in %s%s)" % (control_label, branch_info, control)
+    print "    Control: %s" % cpython
+    print "    Experiment: %s" % pypy
     print
-
-    # Calculate the subshell envs that we'll use to execute the
-    # benchmarks in.
-    if vcs:
-        control_env = {
-            'PYTHONPATH': '%s:%s' % (Path.cwd().absolute(), Path(benchmark_dir)),
-        }
-        experiment_env = control_env.copy()
-    else:
-        control_env = {'PYTHONPATH': '%s:%s' % (Path(control).absolute(), Path(benchmark_dir))}
-        experiment_env = {'PYTHONPATH': '%s:%s' % (Path(experiment).absolute(), Path(benchmark_dir))}
-
+    
+    control_env = {'PYTHONPATH': '.:%s:%s' % (Path(control).absolute(), Path(benchmark_dir))}
+    
     for benchmark in discover_benchmarks(benchmark_dir):
         if not benchmarks or benchmark.name in benchmarks:
             print "Running '%s' benchmark ..." % benchmark.name
             settings_mod = '%s.settings' % benchmark.name
             control_env['DJANGO_SETTINGS_MODULE'] = settings_mod
-            experiment_env['DJANGO_SETTINGS_MODULE'] = settings_mod
+            experiment_env = control_env.copy()
             if profile_dir is not None:
-                control_env['DJANGOBENCH_PROFILE_FILE'] = Path(profile_dir, "con-%s" % benchmark.name)
-                experiment_env['DJANGOBENCH_PROFILE_FILE'] = Path(profile_dir, "exp-%s" % benchmark.name)
+                control_env['DJANGOBENCH_PROFILE_FILE'] = Path(profile_dir, "cpython-%s" % benchmark.name)
+                experiment_env['DJANGOBENCH_PROFILE_FILE'] = Path(profile_dir, "pypy-%s" % benchmark.name)
             try:
-                if vcs: switch_to_branch(vcs, control)
-                control_data = run_benchmark(benchmark, trials, control_env)
-                if vcs: switch_to_branch(vcs, experiment)
-                experiment_data = run_benchmark(benchmark, trials, experiment_env)
+                control_data = run_benchmark(benchmark, trials, control_env, cpython)
+                experiment_data = run_benchmark(benchmark, trials, experiment_env, pypy)
             except SkipBenchmark, reason:
                 print "Skipped: %s\n" % reason
                 continue
@@ -69,8 +63,6 @@ def run_benchmarks(control, experiment, benchmark_dir, benchmarks, trials, vcs=N
                 diff_instrumentation = False,
                 benchmark_name = benchmark.name,
                 disable_timelines = True,
-                control_label = control_label,
-                experiment_label = experiment_label,
             )
             result = perf.CompareBenchmarkData(control_data, experiment_data, options)
             if record_dir:
@@ -78,8 +70,8 @@ def run_benchmarks(control, experiment, benchmark_dir, benchmarks, trials, vcs=N
                     dest = record_dir.child('%s.json' % benchmark.name),
                     name = benchmark.name,
                     result = result,
-                    control = control_label,
-                    experiment = experiment_label,
+                    control = 'cpython',
+                    experiment = 'pypy',
                     control_data = control_data,
                     experiment_data = experiment_data,
                 )
@@ -94,7 +86,7 @@ def discover_benchmarks(benchmark_dir):
 class SkipBenchmark(Exception):
     pass
 
-def run_benchmark(benchmark, trials, env):
+def run_benchmark(benchmark, trials, env, interpreter):
     """
     Similar to perf.MeasureGeneric, but modified a bit for our purposes.
     """
@@ -102,13 +94,14 @@ def run_benchmark(benchmark, trials, env):
     # re-generate fresh ones. This makes sure we're measuring as little of
     # Python's startup time as possible.
     perf.RemovePycs()
-    command = [sys.executable, '%s/benchmark.py' % benchmark]
-    out, _, _ = perf.CallAndCaptureOutput(command + ['-t', 1], env, track_memory=False, inherit_env=[])
+    command = [interpreter, '%s/benchmark.py' % benchmark]
+    #print " - Running command: %s" % command
+    out, _, _ = perf.CallAndCaptureOutput(command + ['-t', 1], env, track_memory=False, inherit_env=['PATH'])
     if out.startswith('SKIP:'):
         raise SkipBenchmark(out.replace('SKIP:', '').strip())
 
     # Now do the actual mesurements.
-    output = perf.CallAndCaptureOutput(command + ['-t', str(trials)], env, track_memory=False, inherit_env=[])
+    output = perf.CallAndCaptureOutput(command + ['-t', str(trials)], env, track_memory=False, inherit_env=['PATH'])
     stdout, stderr, mem_usage = output
     message = email.message_from_string(stdout)
     data_points = [float(line) for line in message.get_payload().splitlines()]
@@ -238,17 +231,6 @@ def main():
         help = "Path to the Django code tree to use as control."
     )
     parser.add_argument(
-        '--experiment',
-        metavar = 'PATH',
-        default = 'django-experiment',
-        help = "Path to the Django version to use as experiment."
-    )
-    parser.add_argument(
-        '--vcs',
-        choices = ['git'],
-        help = 'Use a VCS for control/experiment. Makes --control/--experiment specify branches, not paths.'
-    )
-    parser.add_argument(
         '-t', '--trials',
         type = int,
         default = 50,
@@ -288,11 +270,9 @@ def main():
     args = parser.parse_args()
     run_benchmarks(
         control = args.control,
-        experiment = args.experiment,
         benchmark_dir = args.benchmark_dir,
         benchmarks = args.benchmarks,
         trials = args.trials,
-        vcs = args.vcs,
         record_dir = args.record,
         profile_dir = args.profile_dir
     )
